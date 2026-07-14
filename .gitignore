@@ -1,3 +1,6 @@
 /target
 # Library crate: consumers resolve their own versions, so don't pin ours.
 Cargo.lock
+
+# Session logs (recall) - workspace-level only, never per-repo.
+.recall/
