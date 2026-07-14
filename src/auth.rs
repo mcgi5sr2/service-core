@@ -48,7 +48,13 @@ impl JwksStore {
     /// (Dex briefly unreachable) or auth is disabled, it starts empty and the on-miss
     /// refresh repopulates on the first authenticated request — startup never blocks.
     pub async fn new(issuer: String, audience: String, dev_no_auth: bool) -> anyhow::Result<Arc<Self>> {
-        let http = reqwest::Client::builder().use_rustls_tls().build()?;
+        // Timeouts matter: the refresh runs while holding the single-flight mutex, so a
+        // hung (not erroring) Dex connection would otherwise wedge that lock forever.
+        let http = reqwest::Client::builder()
+            .use_rustls_tls()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+            .build()?;
         let keys = if dev_no_auth || issuer.is_empty() {
             tracing::warn!("service-core auth: DISABLED (dev_no_auth or empty issuer)");
             JwkSet { keys: Vec::new() }
@@ -112,11 +118,17 @@ impl JwksStore {
                     return Err(StatusCode::UNAUTHORIZED);
                 }
                 tracing::warn!("auth: kid '{kid}' not in cache — refreshing JWKS");
-                *self.keys.write().await = Self::fetch_jwks(&self.http, &self.issuer).await.map_err(|e| {
-                    tracing::warn!("auth: JWKS refresh failed: {e}");
-                    StatusCode::UNAUTHORIZED
-                })?;
+                let fetched = Self::fetch_jwks(&self.http, &self.issuer).await;
+                // Arm the cooldown on BOTH success and failure so a down/hung Dex is
+                // rate-limited too — not only a successful refresh.
                 *last = Some(Instant::now());
+                match fetched {
+                    Ok(fresh) => *self.keys.write().await = fresh,
+                    Err(e) => {
+                        tracing::warn!("auth: JWKS refresh failed: {e}");
+                        return Err(StatusCode::UNAUTHORIZED);
+                    }
+                }
             }
         }
 
