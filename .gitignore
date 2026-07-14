@@ -1,0 +1,3 @@
+/target
+# Library crate: consumers resolve their own versions, so don't pin ours.
+Cargo.lock
