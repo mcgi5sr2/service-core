@@ -30,6 +30,18 @@ pub struct Claims {
     pub sub: String,
     pub email: Option<String>,
     pub exp: usize,
+    /// When the user last actually authenticated (OIDC `auth_time`, seconds since epoch).
+    ///
+    /// The claim that makes **step-up re-auth** verifiable: a service can require that the
+    /// password was entered within the last N seconds before allowing something
+    /// destructive. `iat` cannot do this — it is refreshed on every silent token refresh,
+    /// so a fresh `iat` says nothing about whether a human was present.
+    ///
+    /// `Option`, because a provider only has to emit it when the client asks (`max_age`
+    /// or `prompt=login`), and not every provider emits it at all. Absent must therefore
+    /// be treated as "cannot prove re-authentication" — never as "recently authenticated".
+    #[serde(default)]
+    pub auth_time: Option<usize>,
 }
 
 /// A self-refreshing JWKS store with a DoS-hardened refresh path.
@@ -173,7 +185,21 @@ where
 
         if store.dev_no_auth {
             return Ok(AuthenticatedUser {
-                claims: Claims { sub: "dev".into(), email: Some("dev@local".into()), exp: usize::MAX },
+                claims: Claims {
+                    sub: "dev".into(),
+                    email: Some("dev@local".into()),
+                    exp: usize::MAX,
+                    // "Just authenticated". dev_no_auth already disables validation
+                    // entirely, so withholding this would only make step-up-gated actions
+                    // untestable locally without adding any safety — it is the same
+                    // loaded gun, not a second one.
+                    auth_time: Some(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as usize)
+                            .unwrap_or(0),
+                    ),
+                },
             });
         }
 
