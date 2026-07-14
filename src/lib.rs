@@ -1,8 +1,8 @@
-//! service-core — shared building blocks for the internal-tools service fleet.
+//! service-core — shared building blocks for a small Rust service fleet.
 //!
-//! Extracted because the per-service copies had drifted: the gated JWKS refresh
-//! (DoS hardening) shipped in only 2 of ~9 services. Consumed as a git dependency,
-//! like `rust-ldap`, so each service's container build stays self-contained.
+//! One audited home for the OIDC bearer extractor, a bounded async-job store, and
+//! size-capped body reads, instead of copy-pasting them per service. Consumed as a git
+//! dependency (like `rust-ldap`) so each service's container build stays self-contained.
 //!
 //! - [`auth`] — OIDC/Dex bearer validation: a self-refreshing [`auth::JwksStore`]
 //!   (single-flight + cooldown) and the [`auth::AuthenticatedUser`] extractor. The
