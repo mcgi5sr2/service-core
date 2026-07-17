@@ -1,7 +1,16 @@
 [package]
 name = "service-core"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
+
+[features]
+default = []
+# In-process userspace WireGuard transport (src/wg/). Feature-gated because
+# boringtun + smoltcp are heavy and non-tunnel consumers must not pay for them.
+wg = ["dep:boringtun", "dep:smoltcp", "dep:base64", "tokio/net", "tokio/time", "tokio/io-util", "tokio/macros", "tokio/rt"]
+# OpenAI-compatible chat-completion client (src/llm.rs). No extra deps beyond
+# the crate's own reqwest; gated so the API surface is opt-in like the tunnel's.
+llm = []
 
 [dependencies]
 axum = "0.8"
@@ -13,3 +22,12 @@ serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
+
+# --- feature `wg` ---
+# smoltcp = virtual TCP/IP stack; minimal feature set (IP medium + IPv4 + TCP).
+smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "async"], optional = true }
+# boringtun = the WireGuard noise protocol only. default-features=false drops the
+# device/CLI machinery.
+boringtun = { version = "0.7.1", default-features = false, optional = true }
+# Decoding base64 WireGuard keys (WG_PRIVATE_KEY / WG_PEER_PUBLIC_KEY) from env.
+base64 = { version = "0.22", optional = true }
