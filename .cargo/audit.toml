@@ -1,0 +1,17 @@
+# Advisories accepted for this crate, with the reasoning. An entry here silences
+# `cargo audit` for that ID only — everything else still fails the release gate
+# in release.sh, which is the point: a permanently-red audit teaches people to
+# ignore it.
+#
+# RUSTSEC-2023-0071 — Marvin attack: potential key recovery through timing
+# sidechannels in `rsa` 0.9.x. No fixed version exists.
+#   Path: rsa 0.9.10 <- jsonwebtoken 10.4.0 <- service-core
+#   Why accepted: the advisory concerns RSA *private-key* operations (decryption
+#   and signing), whose timing can leak the key. service-core uses jsonwebtoken
+#   only to VERIFY inbound OIDC tokens against the provider's PUBLIC key — it
+#   holds no RSA private key and performs no private-key operation, so the
+#   vulnerable code path is not reachable here.
+#   Revisit if this crate ever signs or decrypts (e.g. issuing its own tokens),
+#   or if a fixed `rsa` is released.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
