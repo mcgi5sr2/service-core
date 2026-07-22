@@ -21,13 +21,14 @@
 //! MIT OR Apache-2.0); the single-target loopback forwarder replaces its
 //! general-purpose `TcpStream`/`TcpListener`.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context as TaskCtx, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use boringtun::x25519::{PublicKey, StaticSecret};
@@ -56,6 +57,15 @@ const HANDSHAKE_STALE_SECS: u64 = 180;
 /// startup) before the watchdog bounces it. Doubles as the startup grace for
 /// the first handshake.
 const REHANDSHAKE_AFTER: Duration = Duration::from_secs(30);
+/// How long [`WgHealth`] may go without an update before the stack task is
+/// presumed dead. That task refreshes it every `TIMER_MS`, so this leaves ~50
+/// ticks of headroom: long enough never to false-positive under load, short
+/// enough that a liveness probe catches a wedged tunnel within one period.
+const HEALTH_FRESH_MS: u64 = 5_000;
+/// How long an abandoned socket may linger before it is aborted and reaped.
+/// Bounds `SocketSet` growth when the tunnel is down and the FIN exchange that
+/// would close the socket gracefully can never complete.
+const ABANDONED_GRACE: Duration = Duration::from_secs(30);
 
 /// Configuration for the WireGuard transport.
 pub struct WgConfig {
@@ -85,28 +95,65 @@ pub struct WgConfig {
 pub struct WgHealth {
     /// Secs since the last completed handshake; `u64::MAX` = none yet.
     last_handshake_secs: Arc<AtomicU64>,
+    /// Millis since `origin` at the last [`WgHealth::set`]. The stack task is
+    /// the only writer, so a value that stops advancing means that task is gone
+    /// and the handshake age above is a fossil rather than a reading.
+    updated_at_ms: Arc<AtomicU64>,
+    origin: Instant,
 }
 
 impl WgHealth {
     fn new() -> Self {
-        Self { last_handshake_secs: Arc::new(AtomicU64::new(u64::MAX)) }
+        Self {
+            last_handshake_secs: Arc::new(AtomicU64::new(u64::MAX)),
+            updated_at_ms: Arc::new(AtomicU64::new(0)),
+            origin: Instant::now(),
+        }
+    }
+
+    /// Test-only: build a handle whose clock already started some time ago, so
+    /// staleness can be exercised without sleeping.
+    #[cfg(test)]
+    fn with_origin(origin: Instant) -> Self {
+        Self { origin, ..Self::new() }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.origin.elapsed().as_millis() as u64
     }
 
     /// Record the current handshake age (called each timer tick by the stack task).
     fn set(&self, age: Option<Duration>) {
         let secs = age.map(|d| d.as_secs()).unwrap_or(u64::MAX);
         self.last_handshake_secs.store(secs, Ordering::Relaxed);
+        self.updated_at_ms.store(self.elapsed_ms(), Ordering::Relaxed);
     }
 
-    /// Secs since the last completed handshake, or `None` if none has completed yet.
+    /// Whether the stack task is still publishing. `false` means that task has
+    /// died — the tunnel cannot recover on its own from there, and the process
+    /// needs restarting. Distinct from a tunnel that is merely down: this is the
+    /// forwarder itself being absent.
+    pub fn stack_alive(&self) -> bool {
+        self.elapsed_ms()
+            .saturating_sub(self.updated_at_ms.load(Ordering::Relaxed))
+            < HEALTH_FRESH_MS
+    }
+
+    /// Secs since the last completed handshake, or `None` if none has completed
+    /// yet — or if the stack task has stopped publishing, in which case the
+    /// stored age says nothing about the tunnel and reporting it would mislead.
     pub fn last_handshake_secs(&self) -> Option<u64> {
+        if !self.stack_alive() {
+            return None;
+        }
         match self.last_handshake_secs.load(Ordering::Relaxed) {
             u64::MAX => None,
             s => Some(s),
         }
     }
 
-    /// True when the session is live — a handshake completed within its lifetime.
+    /// True when the session is live — the stack task is running *and* a
+    /// handshake completed within its lifetime.
     pub fn handshake_ok(&self) -> bool {
         self.last_handshake_secs().is_some_and(|s| s < HANDSHAKE_STALE_SECS)
     }
@@ -115,8 +162,38 @@ impl WgHealth {
 /// State shared between the stack task and the per-connection [`WgStream`]s.
 struct Shared {
     sockets: Mutex<SocketSet<'static>>,
+    /// Handles whose [`WgStream`] has been dropped, and when. A socket is only
+    /// ever removed from `sockets` after it lands here, and that is what makes
+    /// the reap safe: while a stream is alive it may call `get_mut(handle)` at
+    /// any moment, and smoltcp panics on a handle that has already been
+    /// removed. Tying removal to the stream's `Drop` gives each socket exactly
+    /// one owner. Lock order is always `sockets` then `abandoned`.
+    abandoned: Mutex<HashMap<SocketHandle, Instant>>,
     /// Pings the stack task to re-poll after a stream writes or closes.
     repoll: Notify,
+}
+
+/// Take the socket lock, recovering it if a previous holder panicked.
+///
+/// A poisoned mutex is normally a signal to propagate the panic, but here the
+/// cure is worse than the disease: with a plain `unwrap`, one panicking stream
+/// poisons the lock and then *every* subsequent lock in the stack task panics
+/// too, so the tunnel stays dead until the pod is restarted by hand. The
+/// `SocketSet` behind it stays structurally intact (smoltcp's invariants are
+/// per-socket), so recover, shout, and keep forwarding.
+fn lock_sockets(shared: &Shared) -> MutexGuard<'_, SocketSet<'static>> {
+    shared.sockets.lock().unwrap_or_else(|e| {
+        tracing::error!("wg: sockets mutex poisoned by a panicking holder; recovering");
+        e.into_inner()
+    })
+}
+
+/// Companion to [`lock_sockets`] for the abandoned-handle map.
+fn lock_abandoned(shared: &Shared) -> MutexGuard<'_, HashMap<SocketHandle, Instant>> {
+    shared.abandoned.lock().unwrap_or_else(|e| {
+        tracing::error!("wg: abandoned-handle mutex poisoned; recovering");
+        e.into_inner()
+    })
 }
 
 /// A request from the acceptor for the stack task to open a connected socket.
@@ -141,6 +218,7 @@ pub async fn start(cfg: WgConfig) -> io::Result<(SocketAddr, WgHealth)> {
 
     let shared = Arc::new(Shared {
         sockets: Mutex::new(SocketSet::new(Vec::new())),
+        abandoned: Mutex::new(HashMap::new()),
         repoll: Notify::new(),
     });
 
@@ -186,17 +264,30 @@ async fn run(
     loop {
         let now = NetInstant::now();
 
-        // 1. Advance smoltcp and reap any sockets that have fully closed.
+        // 1. Advance smoltcp, then reap sockets whose stream has gone away.
+        //    Only *abandoned* handles are eligible: a handle still owned by a
+        //    live `WgStream` must stay in the set, because that stream can call
+        //    `get_mut` on it at any time and smoltcp panics on a removed handle.
         {
-            let mut sockets = shared.sockets.lock().unwrap();
+            let mut sockets = lock_sockets(&shared);
             iface.poll(now, &mut device, &mut sockets);
+            let mut abandoned = lock_abandoned(&shared);
             handles.retain(|&h| {
-                if sockets.get_mut::<tcp::Socket>(h).state() == tcp::State::Closed {
-                    sockets.remove(h);
-                    false
-                } else {
-                    true
+                let Some(&since) = abandoned.get(&h) else {
+                    return true; // still owned by a live stream
+                };
+                let sock = sockets.get_mut::<tcp::Socket>(h);
+                if sock.state() != tcp::State::Closed {
+                    if since.elapsed() < ABANDONED_GRACE {
+                        return true; // give the FIN exchange time to finish
+                    }
+                    // The close will never complete (typically the tunnel is
+                    // down); drop it hard rather than leak the socket forever.
+                    sock.abort();
                 }
+                sockets.remove(h);
+                abandoned.remove(&h);
+                false
             });
         }
 
@@ -215,7 +306,7 @@ async fn run(
 
         // 3. Sleep until smoltcp next needs servicing (or something wakes us).
         let delay = {
-            let sockets = shared.sockets.lock().unwrap();
+            let sockets = lock_sockets(&shared);
             iface.poll_delay(now, &sockets)
         };
         let sleep = delay
@@ -227,7 +318,7 @@ async fn run(
             // A new connection to open and connect over the tunnel.
             req = open_rx.recv() => {
                 if let Some(req) = req {
-                    let mut sockets = shared.sockets.lock().unwrap();
+                    let mut sockets = lock_sockets(&shared);
                     let rx = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF]);
                     let tx = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF]);
                     let mut sock = tcp::Socket::new(rx, tx);
@@ -353,7 +444,7 @@ impl AsyncRead for WgStream {
         cx: &mut TaskCtx<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let mut sockets = self.shared.sockets.lock().unwrap();
+        let mut sockets = lock_sockets(&self.shared);
         let sock = sockets.get_mut::<tcp::Socket>(self.handle);
         if sock.can_recv() {
             let unfilled = buf.initialize_unfilled();
@@ -385,7 +476,7 @@ impl AsyncWrite for WgStream {
         cx: &mut TaskCtx<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let mut sockets = self.shared.sockets.lock().unwrap();
+        let mut sockets = lock_sockets(&self.shared);
         let sock = sockets.get_mut::<tcp::Socket>(self.handle);
         // Still completing the handshake — wait for the connection to establish
         // rather than treating it as a closed pipe.
@@ -423,11 +514,24 @@ impl AsyncWrite for WgStream {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskCtx<'_>) -> Poll<io::Result<()>> {
-        let mut sockets = self.shared.sockets.lock().unwrap();
+        let mut sockets = lock_sockets(&self.shared);
         sockets.get_mut::<tcp::Socket>(self.handle).close();
         drop(sockets);
         self.shared.repoll.notify_one();
         Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for WgStream {
+    /// Hand the socket back to the stack task. A stream is its socket's sole
+    /// owner for as long as it lives, so this is the one point at which the
+    /// handle becomes eligible for removal — see `Shared::abandoned`.
+    fn drop(&mut self) {
+        let mut sockets = lock_sockets(&self.shared);
+        sockets.get_mut::<tcp::Socket>(self.handle).close();
+        lock_abandoned(&self.shared).insert(self.handle, Instant::now());
+        drop(sockets);
+        self.shared.repoll.notify_one();
     }
 }
 
@@ -577,5 +681,29 @@ mod tests {
         h.set(None);
         assert_eq!(h.last_handshake_secs(), None);
         assert!(!h.handshake_ok());
+    }
+
+    #[test]
+    fn a_dead_stack_task_never_reads_as_healthy() {
+        // Regression: the stack task published a fresh handshake age and then
+        // died. Nothing updates the value afterwards, so it sits frozen at a
+        // healthy-looking number forever. Reporting that as ok is what let a
+        // wedged tunnel masquerade as a working one for hours.
+        let h = WgHealth::with_origin(Instant::now() - Duration::from_secs(60));
+        h.last_handshake_secs.store(2, Ordering::Relaxed);
+
+        assert!(!h.stack_alive());
+        assert_eq!(h.last_handshake_secs(), None, "a fossil is not a reading");
+        assert!(!h.handshake_ok());
+    }
+
+    #[test]
+    fn a_publishing_stack_task_reads_as_alive() {
+        let h = WgHealth::with_origin(Instant::now() - Duration::from_secs(60));
+        h.set(Some(Duration::from_secs(2)));
+
+        assert!(h.stack_alive());
+        assert_eq!(h.last_handshake_secs(), Some(2));
+        assert!(h.handshake_ok());
     }
 }
