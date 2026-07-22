@@ -62,6 +62,14 @@ const REHANDSHAKE_AFTER: Duration = Duration::from_secs(30);
 /// ticks of headroom: long enough never to false-positive under load, short
 /// enough that a liveness probe catches a wedged tunnel within one period.
 const HEALTH_FRESH_MS: u64 = 5_000;
+/// Depth of the open-request channel. The acceptor awaits a free slot rather
+/// than queueing without limit, so a local client opening connections faster
+/// than the stack task can service them is slowed down, not buffered.
+const OPEN_REQUEST_QUEUE: usize = 32;
+/// Ceiling on concurrently open tunnel sockets. Past this the stack task
+/// refuses to open more (the acceptor then drops the loopback connection)
+/// rather than growing the socket set and its per-socket buffers without end.
+const MAX_SOCKETS: usize = 128;
 /// How long an abandoned socket may linger before it is aborted and reaped.
 /// Bounds `SocketSet` growth when the tunnel is down and the FIN exchange that
 /// would close the socket gracefully can never complete.
@@ -223,7 +231,7 @@ pub async fn start(cfg: WgConfig) -> io::Result<(SocketAddr, WgHealth)> {
     });
 
     let health = WgHealth::new();
-    let (open_tx, open_rx) = mpsc::unbounded_channel::<OpenRequest>();
+    let (open_tx, open_rx) = mpsc::channel::<OpenRequest>(OPEN_REQUEST_QUEUE);
     tokio::spawn(acceptor(listener, open_tx, shared.clone()));
     tokio::spawn(run(cfg, tunnel, shared, open_rx, health.clone()));
 
@@ -235,7 +243,7 @@ async fn run(
     cfg: WgConfig,
     mut tunnel: Tunnel,
     shared: Arc<Shared>,
-    mut open_rx: mpsc::UnboundedReceiver<OpenRequest>,
+    mut open_rx: mpsc::Receiver<OpenRequest>,
     health: WgHealth,
 ) {
     let mut device = Device::new(cfg.mtu);
@@ -318,6 +326,16 @@ async fn run(
             // A new connection to open and connect over the tunnel.
             req = open_rx.recv() => {
                 if let Some(req) = req {
+                    if handles.len() >= MAX_SOCKETS {
+                        // Drop `req` (and with it the response channel) — the
+                        // acceptor sees the closed oneshot and drops the
+                        // loopback connection rather than waiting forever.
+                        tracing::warn!(
+                            open = handles.len(),
+                            "wg: socket ceiling reached; refusing new connection"
+                        );
+                        continue;
+                    }
                     let mut sockets = lock_sockets(&shared);
                     let rx = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF]);
                     let tx = tcp::SocketBuffer::new(vec![0u8; SOCKET_BUF]);
@@ -400,7 +418,7 @@ async fn run(
 /// Accept loopback connections and bridge each to a tunnel socket.
 async fn acceptor(
     listener: TcpListener,
-    open_tx: mpsc::UnboundedSender<OpenRequest>,
+    open_tx: mpsc::Sender<OpenRequest>,
     shared: Arc<Shared>,
 ) {
     loop {
@@ -413,7 +431,9 @@ async fn acceptor(
         };
 
         let (tx, rx) = oneshot::channel();
-        if open_tx.send(OpenRequest { resp: tx }).is_err() {
+        // Awaits a free queue slot: backpressure onto the accept loop rather
+        // than an unbounded backlog of pending opens.
+        if open_tx.send(OpenRequest { resp: tx }).await.is_err() {
             return; // stack task is gone
         }
         let handle = match rx.await {
@@ -425,7 +445,12 @@ async fn acceptor(
         tokio::spawn(async move {
             let mut wg = WgStream { shared, handle };
             // Pumps both directions; shuts `wg` down (→ socket.close()) on EOF.
-            let _ = tokio::io::copy_bidirectional(&mut local, &mut wg).await;
+            // A failure here ends one tunnelled request, so say so — silently
+            // dropped connections are the hardest kind to diagnose after the
+            // fact.
+            if let Err(e) = tokio::io::copy_bidirectional(&mut local, &mut wg).await {
+                tracing::warn!("wg: tunnelled connection ended with an error: {e}");
+            }
         });
     }
 }
