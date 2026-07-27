@@ -74,7 +74,8 @@ esac
 VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
 TAG="v$VERSION"
 
-trap 'echo "RELEASE FAILED — reverting uncommitted version bump"; git checkout -- Cargo.toml Cargo.lock' ERR
+BASE_SHA=$(git rev-parse HEAD)
+trap 'echo "RELEASE FAILED — unwinding to a clean tree"; git tag -d "v${VERSION:-}" 2>/dev/null || true; git reset --hard "$BASE_SHA" >/dev/null 2>&1 || true' ERR
 
 # A tag is what consumers resolve against, so it must never be moved once
 # pushed. Refuse rather than clobber.
@@ -94,6 +95,18 @@ git tag -a "$TAG" -m "$TAG"
 git push origin main
 git push origin "$TAG"
 trap - ERR
+
+# Cut a Release from the tag so each version gets a notes page in the repo's
+# Releases tab (auto-generated from the merged PRs). Best-effort: the release is
+# already pushed above, so a Releases-API hiccup only WARNS.
+GHE_REPO=$(git remote get-url release 2>/dev/null || git remote get-url origin 2>/dev/null)
+GHE_REPO=$(printf '%s' "$GHE_REPO" | sed -E 's#^git@([^:]+):(.+)\.git$#\1/\2#')
+if [ -n "$GHE_REPO" ] && command -v gh >/dev/null 2>&1; then
+  gh release create "v$VERSION" -R "$GHE_REPO" --title "v$VERSION" --generate-notes \
+    || echo "release: WARN — could not cut the Release for v$VERSION; by hand: gh release create v$VERSION -R $GHE_REPO --generate-notes" >&2
+else
+  echo "release: WARN — no release/origin remote or gh; skipped the Release for v$VERSION." >&2
+fi
 
 cat <<EOF
 
