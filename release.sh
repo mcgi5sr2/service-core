@@ -29,7 +29,13 @@ if [ "${RELEASE_FORCE:-0}" != "1" ]; then
     echo "release: REFUSING — on branch '$branch'; consumers pin tags cut from main (RELEASE_FORCE=1 overrides)." >&2
     exit 1
   fi
-  git fetch origin --quiet || echo "release: WARN — could not fetch origin; freshness unverified" >&2
+  # Do not swallow this. A failed fetch leaves origin/$branch stale, so the
+  # behind-check below compares against an out-of-date ref, reports 0 behind
+  # and passes vacuously — defeating the guard it sits inside.
+  if ! git fetch origin --quiet; then
+    echo "release: REFUSING — could not fetch origin, so freshness cannot be verified (RELEASE_FORCE=1 overrides)." >&2
+    exit 1
+  fi
   if git rev-parse --verify -q "origin/$branch" >/dev/null; then
     behind=$(git rev-list --count "HEAD..origin/$branch")
     if [ "$behind" -gt 0 ]; then
@@ -67,15 +73,19 @@ else
 fi
 # -----------------------------------------------------------------------------
 
+# Arm the unwind BEFORE anything mutates the tree. cargo set-version rewrites
+# Cargo.toml and Cargo.lock, so a failure there under set -e would otherwise
+# exit with no trap set and leave the bump behind. VERSION expands when the trap
+# FIRES, not when it is defined, so referencing it here is safe.
+BASE_SHA=$(git rev-parse HEAD)
+trap 'echo "RELEASE FAILED — unwinding to a clean tree"; git tag -d "v${VERSION:-}" 2>/dev/null || true; git reset --hard "$BASE_SHA" >/dev/null 2>&1 || true' ERR
+
 case "$BUMP" in
   patch|minor|major) cargo set-version --bump "$BUMP" ;;
   *)                 cargo set-version "$BUMP" ;;
 esac
 VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
 TAG="v$VERSION"
-
-BASE_SHA=$(git rev-parse HEAD)
-trap 'echo "RELEASE FAILED — unwinding to a clean tree"; git tag -d "v${VERSION:-}" 2>/dev/null || true; git reset --hard "$BASE_SHA" >/dev/null 2>&1 || true' ERR
 
 # A tag is what consumers resolve against, so it must never be moved once
 # pushed. Refuse rather than clobber.
