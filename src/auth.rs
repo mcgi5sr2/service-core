@@ -53,13 +53,45 @@ pub struct JwksStore {
     /// Single-flight + cooldown gate for refresh (holds the last successful refresh).
     last_refresh: Mutex<Option<Instant>>,
     dev_no_auth: bool,
+    /// Optional BFF-trust verifier. `None` (the default) leaves behaviour exactly as
+    /// it was — bearer only. When `Some`, a request carrying a BFF assertion is
+    /// accepted through it as an alternative to the bearer. Opt-in via
+    /// [`JwksStore::with_bff_trust`], so no consumer that keeps calling [`new`]
+    /// changes at all.
+    bff: Option<crate::bff::BffTrust>,
 }
 
 impl JwksStore {
     /// Build the store, fetching the initial key set. Fails soft: if the fetch fails
     /// (Dex briefly unreachable) or auth is disabled, it starts empty and the on-miss
     /// refresh repopulates on the first authenticated request — startup never blocks.
-    pub async fn new(issuer: String, audience: String, dev_no_auth: bool) -> anyhow::Result<Arc<Self>> {
+    pub async fn new(
+        issuer: String,
+        audience: String,
+        dev_no_auth: bool,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::build(issuer, audience, dev_no_auth, None).await
+    }
+
+    /// Like [`new`], but also accepts BFF-signed assertions (BFF-trust). A request
+    /// presenting the [`crate::bff::ASSERTION_HEADER`] is verified against `bff`
+    /// instead of the IdP; a plain bearer still works, so this is additive during a
+    /// transition.
+    pub async fn with_bff_trust(
+        issuer: String,
+        audience: String,
+        dev_no_auth: bool,
+        bff: crate::bff::BffTrust,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::build(issuer, audience, dev_no_auth, Some(bff)).await
+    }
+
+    async fn build(
+        issuer: String,
+        audience: String,
+        dev_no_auth: bool,
+        bff: Option<crate::bff::BffTrust>,
+    ) -> anyhow::Result<Arc<Self>> {
         // Timeouts matter: the refresh runs while holding the single-flight mutex, so a
         // hung (not erroring) Dex connection would otherwise wedge that lock forever.
         let http = reqwest::Client::builder()
@@ -77,7 +109,9 @@ impl JwksStore {
                     k
                 }
                 Err(e) => {
-                    tracing::warn!("service-core auth: initial JWKS fetch failed ({e}); lazy retry on first request");
+                    tracing::warn!(
+                        "service-core auth: initial JWKS fetch failed ({e}); lazy retry on first request"
+                    );
                     JwkSet { keys: Vec::new() }
                 }
             }
@@ -89,6 +123,7 @@ impl JwksStore {
             http,
             last_refresh: Mutex::new(None),
             dev_no_auth,
+            bff,
         }))
     }
 
@@ -98,7 +133,10 @@ impl JwksStore {
     }
 
     async fn fetch_jwks(http: &reqwest::Client, issuer: &str) -> anyhow::Result<JwkSet> {
-        let discovery_url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
+        let discovery_url = format!(
+            "{}/.well-known/openid-configuration",
+            issuer.trim_end_matches('/')
+        );
         let discovery: serde_json::Value = http.get(&discovery_url).send().await?.json().await?;
         let jwks_uri = discovery["jwks_uri"]
             .as_str()
@@ -200,6 +238,20 @@ where
                             .unwrap_or(0),
                     ),
                 },
+            });
+        }
+
+        // BFF-trust: if configured AND the request carries a BFF assertion, accept
+        // it in place of a bearer. Absent the config or the header, nothing here
+        // changes — the bearer path below runs exactly as before.
+        if let Some(bff) = &store.bff
+            && let Some(assertion) = parts
+                .headers
+                .get(crate::bff::ASSERTION_HEADER)
+                .and_then(|v| v.to_str().ok())
+        {
+            return Ok(AuthenticatedUser {
+                claims: bff.verify(assertion)?,
             });
         }
 
