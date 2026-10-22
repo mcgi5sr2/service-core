@@ -18,6 +18,7 @@
 //!   chat-completion service, typically reached through the [`wg`] loopback.
 
 pub mod auth;
+pub mod bff;
 pub mod http;
 pub mod jobs;
 #[cfg(feature = "llm")]
