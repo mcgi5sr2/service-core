@@ -229,6 +229,9 @@ impl Login {
     }
 }
 
+/// Security logic with a twin: the fleet's BFF applies the same rule to the
+/// sessions it proxies. Change both together.
+///
 /// Whether the browser says another site's page made this request — as a
 /// subresource, or as a frame (frames are `navigate` too, so the destination
 /// tells them apart from a top-level navigation). Browsers without Fetch
