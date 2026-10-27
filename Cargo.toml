@@ -11,6 +11,13 @@ wg = ["dep:boringtun", "dep:smoltcp", "dep:base64", "tokio/net", "tokio/time", "
 # OpenAI-compatible chat-completion client (src/llm.rs). No extra deps beyond
 # the crate's own reqwest; gated so the API surface is opt-in like the tunnel's.
 llm = []
+# Browser sign-in (src/login/): the OIDC authorization-code + PKCE flow against the
+# identity provider, server-side sessions behind a host-only cookie, and the
+# /auth/{login,callback,logout,me} routes a service UI calls. openidconnect does the
+# protocol; it talks HTTP through the crate's own reqwest (no second client).
+login = ["dep:openidconnect", "dep:getrandom", "dep:base64", "dep:chacha20poly1305"]
+# OpenAPI description of the login routes, for services to nest into their spec.
+openapi = ["login", "dep:utoipa"]
 
 [dependencies]
 axum = "0.8"
@@ -29,5 +36,25 @@ smoltcp = { version = "0.13.1", default-features = false, features = ["std", "me
 # boringtun = the WireGuard noise protocol only. default-features=false drops the
 # device/CLI machinery.
 boringtun = { version = "0.7.1", default-features = false, optional = true }
-# Decoding base64 WireGuard keys (WG_PRIVATE_KEY / WG_PEER_PUBLIC_KEY) from env.
+# Decoding base64 WireGuard keys (WG_PRIVATE_KEY / WG_PEER_PUBLIC_KEY) from env;
+# also encodes login session ids.
 base64 = { version = "0.22", optional = true }
+
+# --- feature `login` ---
+# The audited OIDC protocol implementation. default-features=false drops its own
+# reqwest 0.12 client: login::http adapts the crate's reqwest 0.13 instead.
+openidconnect = { version = "4.0.1", default-features = false, optional = true }
+# Session ids, flow-cookie nonces and the flow-cookie key come straight from the OS CSPRNG.
+getrandom = { version = "0.4.3", optional = true }
+# Seals each in-progress sign-in into its own cookie (AEAD), so there is no shared
+# flow store for an unauthenticated flood to evict.
+chacha20poly1305 = { version = "0.11.0", optional = true }
+
+# --- feature `openapi` ---
+utoipa = { version = "6.0.0", optional = true }
+
+[dev-dependencies]
+# The login flow test runs a fake identity provider on a local port.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tower = { version = "0.5.3", features = ["util"] }
+sha2 = "0.11.1"

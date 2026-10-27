@@ -15,7 +15,7 @@
 //! The public key is distributed as static config rather than via a JWKS endpoint —
 //! smaller surface; JWKS-based rotation is a later add.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use axum::http::StatusCode;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
@@ -28,10 +28,7 @@ use crate::auth::Claims;
 pub const ASSERTION_HEADER: &str = "X-Bff-Assertion";
 
 fn now_secs() -> usize {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as usize)
-        .unwrap_or(0)
+    crate::auth::unix_now() as usize
 }
 
 /// The assertion wire format. Verified back into [`Claims`] (which ignores the

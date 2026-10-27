@@ -1,7 +1,7 @@
 # service-core
 
 Shared building blocks for a small Rust service fleet: OIDC bearer validation, a bounded
-async-job store, and size-capped body reads.
+async-job store, size-capped body reads, and (opt-in) browser sign-in for a service's own UI.
 
 These three pieces were being copy-pasted into every service. Each copy drifted, and a fix to
 one (say, a JWKS refresh hardening) never reached the others. This crate gives them one audited
@@ -81,6 +81,89 @@ let bytes = read_body_capped(resp, 8 * 1024 * 1024, "issuer JWKS").await?;
 Reads a response body while enforcing a byte ceiling, so a remote that streams unboundedly
 cannot exhaust memory. The `what` argument names the source in the error. Prefer this over
 `resp.bytes()` for any response from a host you do not control.
+
+## `login` — browser sign-in (feature `login`)
+
+For a service that serves its own UI: the OIDC authorization-code flow with PKCE against the
+identity provider, a server-side session, and an opaque `HttpOnly` cookie. The browser never
+holds a token, code verifier or nonce.
+
+```toml
+service-core = { git = "…", tag = "…", features = ["login", "openapi"] }
+```
+
+```rust
+use service_core::auth::{AuthOptions, AuthenticatedUser, JwksStore};
+use service_core::login::{Login, LoginConfig};
+
+let login = Login::new(LoginConfig::from_env(dev_no_auth)?)?;
+let jwks = JwksStore::with_options(issuer, audience, dev_no_auth,
+    AuthOptions { login: Some(login.clone()), ..Default::default() }).await?;
+
+let app = Router::new()
+    .route("/api/things", get(things))   // `AuthenticatedUser` now accepts the session too
+    .merge(login.router())               // /auth/login, /auth/callback, /auth/logout, /auth/me
+    .with_state(state);
+```
+
+`LoginConfig::from_env` reads `DEX_ISSUER_URL`, `OIDC_CLIENT_ID`, `PUBLIC_URL` (this service's
+origin, e.g. `https://tool.example.com`) and `LOGIN_SESSION_TTL_SECS` (default 8 h). Register
+`<PUBLIC_URL>/auth/callback` with the provider; several services can share one public client,
+each registering its own callback.
+
+| route | |
+|---|---|
+| `GET /auth/login?returnTo=/path&stepUp=1` | start a sign-in; `stepUp=1` forces the user to re-enter credentials |
+| `GET /auth/callback` | the provider's redirect back |
+| `POST /auth/logout` | end the session; same-origin only |
+| `GET /auth/me` | `{authenticated, sub, email, name}` |
+
+What it guarantees:
+
+- **Host-only cookies.** Over HTTPS every cookie is `__Host-`prefixed, so the browser itself
+  refuses one that is not `Secure`, `Path=/` and domain-less. Services sharing a parent domain
+  never see each other's sessions.
+- **No ambient writes.** A cookie-authenticated `POST`/`PUT`/`PATCH`/`DELETE` must carry this
+  origin's `Origin` (or `Sec-Fetch-Site: same-origin`), or it gets `403`. Bearer requests are
+  unaffected.
+- **A callback finishes only in the browser that started it.** Each sign-in's PKCE verifier,
+  nonce and destination are sealed (XChaCha20-Poly1305, per-process key) into a short-lived
+  cookie for that browser, bound to the flow's `state`. Nothing is held server-side, so a flood
+  of sign-in starts cannot evict anyone's sign-in; a browser keeps at most five such cookies.
+- **Explicit credentials win.** A request with an `Authorization` header is judged on its bearer
+  alone, whatever cookies ride along.
+- **No embedded reads from sibling hosts.** A cookie-authenticated read that the browser marks as
+  made by another site's page (an `<img>`, `fetch`, WebSocket or frame — anything but a top-level
+  navigation) gets `403`. `SameSite=Lax` alone does not cover this: every host under the same
+  registrable domain is the same site.
+- **Starts without the provider.** Discovery happens on the first sign-in; until the provider
+  answers, `/auth/login` returns `503` and everything else keeps working. Key rotations are
+  picked up by re-fetching keys when an ID token fails verification.
+- **Bounded.** Sessions are capped overall and at 20 per user, oldest evicted first, so one
+  person cannot sign everyone else out; responses from the provider are size-capped and never
+  followed through a redirect. A failed callback is retried once, to the same destination and
+  step-up.
+- **Step-up.** The session keeps the ID token's `auth_time`, so `AuthenticatedUser`'s
+  `claims.auth_time` works for a cookie exactly as it does for a bearer.
+
+Sessions and the sign-in key live in one process's memory, so run one replica (or pin each
+browser to one). Sessions hold identity only — no provider tokens — and live in memory: a restart signs
+everyone out, and the provider's own session makes the next sign-in silent. Sign-out is local:
+it ends this service's session, not the provider's. With `dev_no_auth` there is no provider and
+every caller is a stub user; `JwksStore` refuses to start if its `dev_no_auth` and the login's
+disagree.
+
+Two rules the extractor cannot enforce for you:
+
+- **Never change state in a `GET` handler.** Cookie-authenticated reads are allowed from links.
+- **Never combine `login` with a CORS layer that allows credentials** (`allow_credentials(true)`
+  with a mirrored or wildcard origin): it would let other sites read responses with the user's
+  session.
+
+Gate routes with `AuthenticatedUser`. A hand-rolled check on `JwksStore::validate` sees only
+bearers, not sessions, and none of the protections above.
+
+Feature `openapi` adds `login::openapi::LoginApi` (utoipa 6) to merge into the service's spec.
 
 ## Versioning
 

@@ -24,6 +24,14 @@ use tokio::sync::{Mutex, RwLock};
 /// one Dex fetch per interval regardless of load; a rotated key is picked up within it.
 const REFRESH_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// Seconds since the Unix epoch (0 if the clock is before it).
+pub(crate) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Validated token claims.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
@@ -59,6 +67,21 @@ pub struct JwksStore {
     /// [`JwksStore::with_bff_trust`], so no consumer that keeps calling [`new`]
     /// changes at all.
     bff: Option<crate::bff::BffTrust>,
+    /// Optional browser sign-in: when set, a request carrying a live session
+    /// cookie is accepted through it (feature `login`).
+    #[cfg(feature = "login")]
+    login: Option<Arc<crate::login::Login>>,
+}
+
+/// The optional identity paths a [`JwksStore`] accepts besides a bearer token.
+/// Build with `..Default::default()` so a new path never breaks a caller.
+#[derive(Default)]
+pub struct AuthOptions {
+    /// Accept a BFF-signed assertion ([`crate::bff`]).
+    pub bff: Option<crate::bff::BffTrust>,
+    /// Accept the browser session cookie of this service's own sign-in.
+    #[cfg(feature = "login")]
+    pub login: Option<Arc<crate::login::Login>>,
 }
 
 impl JwksStore {
@@ -70,10 +93,10 @@ impl JwksStore {
         audience: String,
         dev_no_auth: bool,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::build(issuer, audience, dev_no_auth, None).await
+        Self::with_options(issuer, audience, dev_no_auth, AuthOptions::default()).await
     }
 
-    /// Like [`new`], but also accepts BFF-signed assertions (BFF-trust). A request
+    /// Like [`new`](Self::new), but also accepts BFF-signed assertions (BFF-trust). A request
     /// presenting the [`crate::bff::ASSERTION_HEADER`] is verified against `bff`
     /// instead of the IdP; a plain bearer still works, so this is additive during a
     /// transition.
@@ -83,22 +106,32 @@ impl JwksStore {
         dev_no_auth: bool,
         bff: crate::bff::BffTrust,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::build(issuer, audience, dev_no_auth, Some(bff)).await
+        Self::with_options(issuer, audience, dev_no_auth, AuthOptions { bff: Some(bff), ..Default::default() }).await
     }
 
-    async fn build(
+    /// Like [`new`](Self::new), with any of the optional identity paths in [`AuthOptions`].
+    /// Order of precedence in [`AuthenticatedUser`]: `dev_no_auth`, BFF assertion,
+    /// bearer (when an `Authorization` header is present), session cookie.
+    ///
+    /// Each path is an `Option` here and an `if let` in the extractor. Should a
+    /// third arrive, the shape to move to is a list of identity sources tried in
+    /// order; `AuthOptions` keeps that change invisible to callers.
+    pub async fn with_options(
         issuer: String,
         audience: String,
         dev_no_auth: bool,
-        bff: Option<crate::bff::BffTrust>,
+        options: AuthOptions,
     ) -> anyhow::Result<Arc<Self>> {
-        // Timeouts matter: the refresh runs while holding the single-flight mutex, so a
-        // hung (not erroring) Dex connection would otherwise wedge that lock forever.
-        let http = reqwest::Client::builder()
-            .use_rustls_tls()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(10))
-            .build()?;
+        // One answer to "who is signed in" for the page and the API: a sign-in in
+        // dev mode with real validation here (or the reverse) would show a user as
+        // signed in while every API call failed.
+        #[cfg(feature = "login")]
+        if let Some(login) = &options.login
+            && login.is_disabled() != dev_no_auth
+        {
+            anyhow::bail!("service-core auth: dev_no_auth is {dev_no_auth} but the login's is {}; they must match", login.is_disabled());
+        }
+        let http = crate::http::idp_client_builder().build()?;
         let keys = if dev_no_auth || issuer.is_empty() {
             tracing::warn!("service-core auth: DISABLED (dev_no_auth or empty issuer)");
             JwkSet { keys: Vec::new() }
@@ -123,7 +156,9 @@ impl JwksStore {
             http,
             last_refresh: Mutex::new(None),
             dev_no_auth,
-            bff,
+            bff: options.bff,
+            #[cfg(feature = "login")]
+            login: options.login,
         }))
     }
 
@@ -231,12 +266,7 @@ where
                     // entirely, so withholding this would only make step-up-gated actions
                     // untestable locally without adding any safety — it is the same
                     // loaded gun, not a second one.
-                    auth_time: Some(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as usize)
-                            .unwrap_or(0),
-                    ),
+                    auth_time: Some(unix_now() as usize),
                 },
             });
         }
@@ -255,9 +285,22 @@ where
             });
         }
 
-        let token = parts
-            .headers
-            .get("Authorization")
+        // An explicit credential wins over an ambient one: a request that names
+        // its bearer is judged on it alone, whatever cookies the browser attached.
+        let authorization = parts.headers.get("Authorization");
+
+        // Browser session: a live session cookie stands in for a bearer. No
+        // cookie or no live session falls through, so an expired session ends as
+        // the usual 401.
+        #[cfg(feature = "login")]
+        if authorization.is_none()
+            && let Some(login) = &store.login
+            && let Some(result) = login.authenticate(parts)
+        {
+            return result.map(|claims| AuthenticatedUser { claims });
+        }
+
+        let token = authorization
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or_else(|| {
