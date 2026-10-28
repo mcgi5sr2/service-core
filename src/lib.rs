@@ -16,11 +16,19 @@
 //!   not pay for them.
 //! - [`llm`] (feature `llm`) — a bounded client for an OpenAI-compatible
 //!   chat-completion service, typically reached through the [`wg`] loopback.
+//! - [`login`] (feature `login`) — browser sign-in for a service's own UI: the
+//!   OIDC authorization-code + PKCE flow, server-side sessions behind a host-only
+//!   cookie, and `/auth/{login,callback,logout,me}`. The session is accepted by
+//!   [`auth::AuthenticatedUser`] like a bearer. Feature `openapi` adds the routes'
+//!   OpenAPI description.
 
 pub mod auth;
+pub mod bff;
 pub mod http;
 pub mod jobs;
 #[cfg(feature = "llm")]
 pub mod llm;
+#[cfg(feature = "login")]
+pub mod login;
 #[cfg(feature = "wg")]
 pub mod wg;

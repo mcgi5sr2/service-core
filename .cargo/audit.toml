@@ -5,13 +5,27 @@
 #
 # RUSTSEC-2023-0071 — Marvin attack: potential key recovery through timing
 # sidechannels in `rsa` 0.9.x. No fixed version exists.
-#   Path: rsa 0.9.10 <- jsonwebtoken 10.4.0 <- service-core
-#   Why accepted: the advisory concerns RSA *private-key* operations (decryption
-#   and signing), whose timing can leak the key. service-core uses jsonwebtoken
-#   only to VERIFY inbound OIDC tokens against the provider's PUBLIC key — it
-#   holds no RSA private key and performs no private-key operation, so the
-#   vulnerable code path is not reachable here.
-#   Revisit if this crate ever signs or decrypts (e.g. issuing its own tokens),
-#   or if a fixed `rsa` is released.
+#   Path: rsa 0.9.10 <- jsonwebtoken 10.4.0 (and openidconnect 4.0.1) <- service-core
+#   Where the private key is used: only `bff::mint`, which signs RS256 assertions
+#   and is called by a BFF upstream — never by a service consuming this crate,
+#   which only VERIFIES tokens against public keys (not affected).
+#   Why accepted for `mint`: Marvin's practical attack is a timing oracle on
+#   PKCS#1 v1.5 *decryption*; jsonwebtoken never decrypts. Signing timing
+#   variance is the same class of leak but far harder to exploit remotely, and
+#   the signing key is a short-lived-assertion key for one internal hop.
+#   Revisit: if `mint` gets a production caller, build that caller on
+#   jsonwebtoken's aws-lc-rs backend (or gate `mint` behind a feature) so the
+#   signing path leaves `rsa` 0.9; or when a fixed `rsa` is released.
+#
+# RUSTSEC-2026-0387 — timing variability in crypto-bigint 0.5 operations meant
+# to be constant-time. Fixed only in crypto-bigint >= 0.7.6, which no release of
+# jsonwebtoken (10.x, 11.x) or openidconnect (4.0.1) can use yet: both pin
+# p256/p384 0.13 -> elliptic-curve 0.13 -> crypto-bigint 0.5.
+#   Path: crypto-bigint 0.5.5 <- elliptic-curve <- p256/p384 <- jsonwebtoken, openidconnect
+#   Why accepted: a timing side channel leaks the secret inputs of an operation.
+#   service-core reaches elliptic-curve code only to VERIFY signatures (ID
+#   tokens, bearer tokens) against the provider's PUBLIC keys — every input is
+#   public. It never signs or decrypts with an EC key.
+#   Revisit when jsonwebtoken or openidconnect moves to elliptic-curve 0.14.
 [advisories]
-ignore = ["RUSTSEC-2023-0071"]
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0387"]

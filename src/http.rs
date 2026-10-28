@@ -1,4 +1,5 @@
-//! Size-capped response-body reading.
+//! Size-capped response-body reading, and the HTTP client settings for talking
+//! to an identity provider.
 
 use anyhow::{Context, Result};
 
@@ -21,4 +22,14 @@ pub async fn read_body_capped(mut resp: reqwest::Response, max: u64, what: &str)
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
+}
+
+/// A client builder for identity-provider calls (discovery, keys, tokens):
+/// rustls, and timeouts that matter — these calls run under single-flight
+/// locks, so a hung (not erroring) provider must fail rather than wedge them.
+pub(crate) fn idp_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .use_rustls_tls()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
 }
