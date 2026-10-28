@@ -99,7 +99,9 @@ if git ls-remote --exit-code --tags origin "$TAG" >/dev/null 2>&1; then
 fi
 
 echo "Releasing service-core $TAG"
-git add Cargo.toml Cargo.lock
+# A library does not commit Cargo.lock (it is gitignored here), so stage it
+# only if it is tracked; adding an ignored path fails the release.
+git add Cargo.toml $(git ls-files Cargo.lock)
 git commit -m "chore: $VERSION"
 git tag -a "$TAG" -m "$TAG"
 git push origin main
