@@ -106,7 +106,11 @@ impl JwksStore {
         dev_no_auth: bool,
         bff: crate::bff::BffTrust,
     ) -> anyhow::Result<Arc<Self>> {
-        Self::with_options(issuer, audience, dev_no_auth, AuthOptions { bff: Some(bff), ..Default::default() }).await
+        // Without the `login` feature `bff` is the only field, but the update is
+        // the documented way to build AuthOptions and covers the gated fields.
+        #[allow(clippy::needless_update)]
+        let options = AuthOptions { bff: Some(bff), ..Default::default() };
+        Self::with_options(issuer, audience, dev_no_auth, options).await
     }
 
     /// Like [`new`](Self::new), with any of the optional identity paths in [`AuthOptions`].
