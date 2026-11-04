@@ -185,6 +185,11 @@ impl Login {
     }
 
     /// True when sign-in is bypassed for local development.
+    /// The provider's issuer URL (`None` in `dev_no_auth`).
+    pub(crate) fn issuer(&self) -> Option<&str> {
+        self.provider.as_ref().map(provider::Provider::issuer)
+    }
+
     pub fn is_disabled(&self) -> bool {
         self.provider.is_none()
     }

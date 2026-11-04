@@ -105,6 +105,38 @@ async fn refuses_a_token_for_another_audience_an_expired_one_and_another_issuer(
 }
 
 #[tokio::test]
+async fn keeps_the_two_audiences_apart_and_needs_both_claims() {
+    let issuer = start_idp().await;
+    let store = store(&issuer, false).await;
+    let both = sign("k1", &json!({ "iss": issuer, "sub": "user-1", "aud": [AUDIENCE, PEER_AUDIENCE], "exp": now() + 600 }));
+    // Issued for both: neither a peer token nor a credential here.
+    assert_eq!(store.peer_token(&forwarded(&both), &user("user-1"), "peer").await.unwrap_err(), StatusCode::UNAUTHORIZED);
+    assert_eq!(store.validate(&both).await.unwrap_err(), StatusCode::UNAUTHORIZED);
+    // An ordinary token is still a credential, and a peer token isn't one.
+    assert_eq!(store.validate(&token(&issuer, "user-1", AUDIENCE, now() + 600)).await.unwrap().sub, "user-1");
+    assert_eq!(store.validate(&token(&issuer, "user-1", PEER_AUDIENCE, now() + 600)).await.unwrap_err(), StatusCode::UNAUTHORIZED);
+    // The library would skip the audience check on a token without one.
+    let no_audience = sign("k1", &json!({ "iss": issuer, "sub": "user-1", "exp": now() + 600 }));
+    assert_eq!(store.peer_token(&forwarded(&no_audience), &user("user-1"), "peer").await.unwrap_err(), StatusCode::UNAUTHORIZED);
+    assert_eq!(store.validate(&no_audience).await.unwrap_err(), StatusCode::UNAUTHORIZED);
+    let no_issuer = sign("k1", &json!({ "sub": "user-1", "aud": PEER_AUDIENCE, "exp": now() + 600 }));
+    assert_eq!(store.peer_token(&forwarded(&no_issuer), &user("user-1"), "peer").await.unwrap_err(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn refuses_a_bad_signature_and_an_unknown_key() {
+    let issuer = start_idp().await;
+    let store = store(&issuer, false).await;
+    let good = token(&issuer, "user-1", PEER_AUDIENCE, now() + 600);
+    let (body, signature) = good.rsplit_once('.').unwrap();
+    let flipped = if signature.starts_with('A') { "B" } else { "A" };
+    let forged = format!("{body}.{flipped}{}", &signature[1..]);
+    assert_eq!(store.peer_token(&forwarded(&forged), &user("user-1"), "peer").await.unwrap_err(), StatusCode::UNAUTHORIZED);
+    let unknown_key = sign("k9", &json!({ "iss": issuer, "sub": "user-1", "aud": PEER_AUDIENCE, "exp": now() + 600 }));
+    assert_eq!(store.peer_token(&forwarded(&unknown_key), &user("user-1"), "peer").await.unwrap_err(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn an_unknown_peer_is_a_server_error() {
     let issuer = start_idp().await;
     let store = store(&issuer, false).await;
@@ -117,18 +149,34 @@ async fn dev_mode_passes_the_header_through() {
     let store = store("", true).await;
     let got = store.peer_token(&forwarded("anything"), &user("dev"), "peer").await.unwrap().unwrap();
     assert_eq!(got.bearer(), "anything");
+    assert_eq!(got.claims().sub, "dev");
 }
 
 #[tokio::test]
 async fn refuses_a_peer_that_would_accept_ordinary_tokens_repeats_another_or_takes_a_credential_header() {
-    let build = |peers: Vec<Peer>| JwksStore::with_options(String::new(), AUDIENCE.into(), true, AuthOptions { peers, ..Default::default() });
+    let refusal = async |peers: Vec<Peer>| {
+        match JwksStore::with_options(String::new(), AUDIENCE.into(), true, AuthOptions { peers, ..Default::default() }).await {
+            Ok(_) => String::from("accepted"),
+            Err(error) => error.to_string(),
+        }
+    };
     let header = || HeaderName::from_static(PEER_HEADER);
-    assert!(build(vec![Peer::new("peer", header(), AUDIENCE)]).await.is_err());
-    assert!(build(vec![Peer::new("peer", header(), "")]).await.is_err());
-    assert!(build(vec![peer(), Peer::new("peer", HeaderName::from_static("x-other"), "third-service")]).await.is_err());
-    assert!(build(vec![peer(), Peer::new("other", header(), "third-service")]).await.is_err());
+    assert!(refusal(vec![Peer::new("peer", header(), AUDIENCE)]).await.contains("audience of its own"));
+    assert!(refusal(vec![Peer::new("peer", header(), "")]).await.contains("audience of its own"));
+    assert!(refusal(vec![peer(), Peer::new("peer", HeaderName::from_static("x-other"), "third-service")]).await.contains("repeats"));
+    assert!(refusal(vec![peer(), Peer::new("other", header(), "third-service")]).await.contains("repeats"));
     for credential in ["authorization", "cookie", "x-bff-assertion"] {
-        assert!(build(vec![Peer::new("peer", HeaderName::from_static(credential), PEER_AUDIENCE)]).await.is_err(), "{credential}");
+        assert!(refusal(vec![Peer::new("peer", HeaderName::from_static(credential), PEER_AUDIENCE)]).await.contains("credential header"), "{credential}");
     }
-    assert!(build(vec![peer()]).await.is_ok());
+    assert_eq!(refusal(vec![peer()]).await, "accepted");
+}
+
+#[cfg(feature = "login")]
+#[tokio::test]
+async fn refuses_peers_when_the_login_has_another_provider() {
+    use service_core::login::{Login, LoginConfig};
+    let login = Login::new(LoginConfig::new("https://other-provider.example", "client", "https://tool.example.com")).unwrap();
+    let options = AuthOptions { peers: vec![peer()], login: Some(login), ..Default::default() };
+    let error = JwksStore::with_options("https://provider.example".into(), AUDIENCE.into(), false, options).await.err().unwrap();
+    assert!(error.to_string().contains("one provider"));
 }

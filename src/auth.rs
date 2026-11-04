@@ -140,6 +140,14 @@ impl JwksStore {
         {
             anyhow::bail!("service-core auth: dev_no_auth is {dev_no_auth} but the login's is {}; they must match", login.is_disabled());
         }
+        // A peer token's subject is compared with the request user's, so both must come from one provider.
+        #[cfg(feature = "login")]
+        if !options.peers.is_empty()
+            && let Some(login_issuer) = options.login.as_ref().and_then(|login| login.issuer())
+            && login_issuer.trim_end_matches('/') != issuer.trim_end_matches('/')
+        {
+            anyhow::bail!("service-core auth: the login's issuer {login_issuer} is not {issuer}; peer tokens need one provider");
+        }
         for (i, peer) in options.peers.iter().enumerate() {
             if peer.audience.is_empty() || peer.audience == audience {
                 // The service's own audience would make every ordinary token pass as a peer token.
@@ -205,14 +213,25 @@ impl JwksStore {
     /// Validate a bearer token and return its claims. Handles the gated JWKS refresh
     /// internally. Returns `401` on any failure (fail-closed).
     pub async fn validate(&self, token: &str) -> Result<Claims, StatusCode> {
-        self.validate_for(token, &self.audience).await
+        let (claims, audiences) = self.validate_for(token, &self.audience).await?;
+        // A token also issued for a peer is a peer token, not a credential here.
+        if self.peers.iter().any(|peer| audiences.contains(&peer.audience)) {
+            tracing::warn!("auth: bearer is also issued for a peer — rejecting");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        Ok(claims)
     }
 
-    /// The peer token `peer` forwarded on this request, verified for `user` (the
-    /// request's authenticated user): `None` when the request carries none, `401`
-    /// when it carries one that fails validation (issuer, keys, the peer's audience,
-    /// expiry) or belongs to someone else. A `peer` this store wasn't built with is a
-    /// programming error, answered `500`. See [`crate::peer`] for the trust model.
+    /// The peer token `peer` forwarded on this request, verified for `user`: `None`
+    /// when the request carries none, `401` when it carries one that fails
+    /// validation (issuer, keys, the peer's audience, expiry), is also issued for
+    /// this service, or belongs to someone else. A `peer` this store wasn't built
+    /// with is a programming error, answered `500`. See [`crate::peer`] for the
+    /// trust model.
+    ///
+    /// `user` must be the claims of this request's [`AuthenticatedUser`]: the check
+    /// binds the token to whoever `user` names, so claims from anywhere else bind it
+    /// to nothing.
     ///
     /// With `dev_no_auth` the header is passed through unverified, as every other
     /// credential is.
@@ -231,7 +250,11 @@ impl JwksStore {
         if self.dev_no_auth {
             return Ok(Some(crate::peer::PeerToken { token: token.to_owned(), claims: user.clone() }));
         }
-        let claims = self.validate_for(token, &config.audience).await?;
+        let (claims, audiences) = self.validate_for(token, &config.audience).await?;
+        if audiences.contains(&self.audience) {
+            tracing::warn!("auth: peer '{peer}' token is also issued for this service — rejecting");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
         if claims.sub != user.sub {
             tracing::warn!("auth: peer '{peer}' token is for another subject than the request's user");
             return Err(StatusCode::UNAUTHORIZED);
@@ -239,8 +262,9 @@ impl JwksStore {
         Ok(Some(crate::peer::PeerToken { token: token.to_owned(), claims }))
     }
 
-    /// [`validate`](Self::validate) for any audience this issuer serves.
-    async fn validate_for(&self, token: &str, audience: &str) -> Result<Claims, StatusCode> {
+    /// [`validate`](Self::validate) for any audience this issuer serves: the claims
+    /// and every audience the token names.
+    async fn validate_for(&self, token: &str, audience: &str) -> Result<(Claims, Vec<String>), StatusCode> {
         let header = decode_header(token).map_err(|e| {
             tracing::warn!("auth: failed to decode JWT header: {e}");
             StatusCode::UNAUTHORIZED
@@ -258,10 +282,10 @@ impl JwksStore {
             let still_missing = self.keys.read().await.find(&kid).is_none();
             if still_missing {
                 if matches!(*last, Some(t) if t.elapsed() < REFRESH_COOLDOWN) {
-                    tracing::warn!("auth: kid '{kid}' unknown and refresh on cooldown — rejecting");
+                    tracing::warn!("auth: kid {kid:?} unknown and refresh on cooldown — rejecting");
                     return Err(StatusCode::UNAUTHORIZED);
                 }
-                tracing::warn!("auth: kid '{kid}' not in cache — refreshing JWKS");
+                tracing::warn!("auth: kid {kid:?} not in cache — refreshing JWKS");
                 let fetched = Self::fetch_jwks(&self.http, &self.issuer).await;
                 // Arm the cooldown on BOTH success and failure so a down/hung Dex is
                 // rate-limited too — not only a successful refresh.
@@ -278,7 +302,7 @@ impl JwksStore {
 
         let keys = self.keys.read().await;
         let jwk = keys.find(&kid).ok_or_else(|| {
-            tracing::warn!("auth: kid '{kid}' not found after refresh");
+            tracing::warn!("auth: kid {kid:?} not found after refresh");
             StatusCode::UNAUTHORIZED
         })?;
         let decoding_key = DecodingKey::from_jwk(jwk).map_err(|e| {
@@ -289,12 +313,39 @@ impl JwksStore {
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[&self.issuer]);
         validation.set_audience(&[audience]);
-        decode::<Claims>(token, &decoding_key, &validation)
-            .map(|data| data.claims)
+        // The library checks iss and aud only when present; a token without them must not pass.
+        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+        decode::<Validated>(token, &decoding_key, &validation)
+            .map(|data| (data.claims.claims, data.claims.aud.into_vec()))
             .map_err(|e| {
                 tracing::warn!("auth: token validation failed: {e}");
                 StatusCode::UNAUTHORIZED
             })
+    }
+}
+
+/// A validated token's claims with its audience, which [`Claims`] leaves out.
+#[derive(Deserialize)]
+struct Validated {
+    #[serde(flatten)]
+    claims: Claims,
+    aud: Audience,
+}
+
+/// `aud`: one audience or several.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Audience {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Audience {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Audience::One(one) => vec![one],
+            Audience::Many(many) => many,
+        }
     }
 }
 

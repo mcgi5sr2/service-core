@@ -71,6 +71,11 @@ pub(crate) struct Provider {
 }
 
 impl Provider {
+    /// The provider's issuer URL, as configured.
+    pub fn issuer(&self) -> &str {
+        self.issuer.as_str()
+    }
+
     pub fn new(issuer: IssuerUrl, client_id: ClientId, redirect_uri: RedirectUrl, scopes: Vec<Scope>) -> anyhow::Result<Self> {
         Ok(Self {
             issuer,
