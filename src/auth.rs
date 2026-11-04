@@ -224,8 +224,8 @@ impl JwksStore {
 
     /// The peer token `peer` forwarded on this request, verified for `user`: `None`
     /// when the request carries none, `401` when it carries one that fails
-    /// validation (issuer, keys, the peer's audience, expiry), is also issued for
-    /// this service, or belongs to someone else. A `peer` this store wasn't built
+    /// validation (issuer, keys, the peer's audience, expiry) or belongs to someone
+    /// else. A `peer` this store wasn't built
     /// with is a programming error, answered `500`. See [`crate::peer`] for the
     /// trust model.
     ///
@@ -250,11 +250,11 @@ impl JwksStore {
         if self.dev_no_auth {
             return Ok(Some(crate::peer::PeerToken { token: token.to_owned(), claims: user.clone() }));
         }
-        let (claims, audiences) = self.validate_for(token, &config.audience).await?;
-        if audiences.contains(&self.audience) {
-            tracing::warn!("auth: peer '{peer}' token is also issued for this service — rejecting");
-            return Err(StatusCode::UNAUTHORIZED);
-        }
+        // A token for the peer may name this service's audience too: a provider issuing a
+        // cross-client token adds the requesting client (Dex always does), and a service
+        // behind a BFF often takes the BFF's client id as its audience. So that is no reason
+        // to refuse it here; `validate` is what keeps such a token from being a credential.
+        let (claims, _) = self.validate_for(token, &config.audience).await?;
         if claims.sub != user.sub {
             tracing::warn!("auth: peer '{peer}' token is for another subject than the request's user");
             return Err(StatusCode::UNAUTHORIZED);

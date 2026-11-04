@@ -84,7 +84,8 @@ async fn handler(State(jwks): State<Arc<JwksStore>>, user: AuthenticatedUser, he
 A peer's audience must be its own: `with_options` refuses one that is empty or this service's
 audience, a repeated name or header, and a credential header (`Authorization`, `Cookie`, the
 BFF assertion's), and a login whose provider isn't the store's. A token issued for both this
-service and the peer is neither a peer token nor a bearer here. With a provider that gives each
+service and the peer is a peer token but never a bearer here: a provider's cross-client token
+names the requesting client too, which is often this service's audience. With a provider that gives each
 client its own (pairwise) subject for a user, the subjects never match and every peer token is
 refused. What the peer lets the token do, and how old it may be,
 is for the peer to enforce. The raw token is never logged, and `PeerToken`'s `Debug` leaves it
