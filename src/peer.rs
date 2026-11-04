@@ -26,8 +26,10 @@ use axum::http::HeaderName;
 
 use crate::auth::Claims;
 
-/// A peer service whose tokens this service accepts in a header.
+/// A peer service whose tokens this service accepts in a header. Build with
+/// [`Peer::new`], so a later field doesn't break callers.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Peer {
     /// What callers name the peer by in [`crate::auth::JwksStore::peer_token`].
     pub name: String,
@@ -35,6 +37,12 @@ pub struct Peer {
     pub header: HeaderName,
     /// The audience the peer's tokens are issued for (the peer's client id).
     pub audience: String,
+}
+
+impl Peer {
+    pub fn new(name: impl Into<String>, header: HeaderName, audience: impl Into<String>) -> Self {
+        Self { name: name.into(), header, audience: audience.into() }
+    }
 }
 
 /// A verified peer token: the bearer to send the peer, and its claims.

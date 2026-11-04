@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{FromRef, FromRequestParts};
+use axum::http::header::{AUTHORIZATION, COOKIE};
 use axum::http::{HeaderMap, StatusCode, request::Parts};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
@@ -75,8 +76,9 @@ pub struct JwksStore {
     peers: Vec<crate::peer::Peer>,
 }
 
-/// The optional identity paths a [`JwksStore`] accepts besides a bearer token.
-/// Build with `..Default::default()` so a new path never breaks a caller.
+/// The optional identity paths a [`JwksStore`] accepts besides a bearer token, and
+/// its other optional settings. Build with `..Default::default()` so a new field
+/// never breaks a caller.
 #[derive(Default)]
 pub struct AuthOptions {
     /// Accept a BFF-signed assertion ([`crate::bff`]).
@@ -112,9 +114,6 @@ impl JwksStore {
         dev_no_auth: bool,
         bff: crate::bff::BffTrust,
     ) -> anyhow::Result<Arc<Self>> {
-        // Without the `login` feature `bff` is the only field, but the update is
-        // the documented way to build AuthOptions and covers the gated fields.
-        #[allow(clippy::needless_update)]
         let options = AuthOptions { bff: Some(bff), ..Default::default() };
         Self::with_options(issuer, audience, dev_no_auth, options).await
     }
@@ -148,6 +147,10 @@ impl JwksStore {
             }
             if options.peers[..i].iter().any(|other| other.name == peer.name || other.header == peer.header) {
                 anyhow::bail!("service-core auth: peer '{}' repeats another peer's name or header", peer.name);
+            }
+            // A credential header would make the peer token double as the request's own credential.
+            if [AUTHORIZATION, COOKIE].contains(&peer.header) || peer.header.as_str() == crate::bff::ASSERTION_HEADER.to_ascii_lowercase() {
+                anyhow::bail!("service-core auth: peer '{}' header '{}' is a credential header", peer.name, peer.header);
             }
         }
         let http = crate::http::idp_client_builder().build()?;

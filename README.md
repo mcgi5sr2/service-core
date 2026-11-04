@@ -66,10 +66,11 @@ request already authenticated as. Without that check, a caller could pair their 
 someone else's peer token.
 
 ```rust
+use axum::http::{HeaderMap, HeaderName, StatusCode};
 use service_core::auth::{AuthOptions, AuthenticatedUser, JwksStore};
 use service_core::peer::Peer;
 
-let peers = vec![Peer { name: "tracker".into(), header: HeaderName::from_static("x-tracker-token"), audience: "tracker".into() }];
+let peers = vec![Peer::new("tracker", HeaderName::from_static("x-tracker-token"), "tracker")];
 let jwks = JwksStore::with_options(issuer, audience, false, AuthOptions { peers, ..Default::default() }).await?;
 
 async fn handler(State(jwks): State<Arc<JwksStore>>, user: AuthenticatedUser, headers: HeaderMap) -> Result<String, StatusCode> {
@@ -81,7 +82,8 @@ async fn handler(State(jwks): State<Arc<JwksStore>>, user: AuthenticatedUser, he
 ```
 
 A peer's audience must be its own: `with_options` refuses one that is empty or this service's
-audience, and a repeated name or header. What the peer lets the token do, and how old it may be,
+audience, a repeated name or header, and a credential header (`Authorization`, `Cookie`, the
+BFF assertion's). What the peer lets the token do, and how old it may be,
 is for the peer to enforce. The raw token is never logged, and `PeerToken`'s `Debug` leaves it
 out.
 

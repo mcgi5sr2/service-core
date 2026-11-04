@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::routing::get;
 use axum::{Json, Router};
-use serde_json::{Value, json};
+use serde_json::json;
 use service_core::auth::{AuthOptions, Claims, JwksStore};
 use service_core::peer::Peer;
 
@@ -34,7 +34,7 @@ async fn start_idp() -> String {
 }
 
 fn peer() -> Peer {
-    Peer { name: "peer".into(), header: HeaderName::from_static(PEER_HEADER), audience: PEER_AUDIENCE.into() }
+    Peer::new("peer", HeaderName::from_static(PEER_HEADER), PEER_AUDIENCE)
 }
 
 async fn store(issuer: &str, dev_no_auth: bool) -> Arc<JwksStore> {
@@ -88,17 +88,20 @@ async fn refuses_someone_elses_peer_token() {
 async fn refuses_a_token_for_another_audience_an_expired_one_and_another_issuer() {
     let issuer = start_idp().await;
     let store = store(&issuer, false).await;
-    let cases: [(&str, Value); 3] = [
+    let cases = [
         // This service's own token is not a peer token.
-        ("own audience", json!(token(&issuer, "user-1", AUDIENCE, now() + 600))),
-        ("expired", json!(token(&issuer, "user-1", PEER_AUDIENCE, now() - 120))),
-        ("other issuer", json!(token("http://elsewhere.example", "user-1", PEER_AUDIENCE, now() + 600))),
+        ("own audience", token(&issuer, "user-1", AUDIENCE, now() + 600)),
+        ("expired", token(&issuer, "user-1", PEER_AUDIENCE, now() - 120)),
+        ("other issuer", token("http://elsewhere.example", "user-1", PEER_AUDIENCE, now() + 600)),
     ];
     for (what, sent) in cases {
-        let result = store.peer_token(&forwarded(sent.as_str().unwrap()), &user("user-1"), "peer").await;
+        let result = store.peer_token(&forwarded(&sent), &user("user-1"), "peer").await;
         assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED, "{what}");
     }
     assert_eq!(store.peer_token(&forwarded("not-a-jwt"), &user("user-1"), "peer").await.unwrap_err(), StatusCode::UNAUTHORIZED);
+    let mut not_ascii = HeaderMap::new();
+    not_ascii.insert(PEER_HEADER, HeaderValue::from_bytes("tök".as_bytes()).unwrap());
+    assert_eq!(store.peer_token(&not_ascii, &user("user-1"), "peer").await.unwrap_err(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -117,12 +120,15 @@ async fn dev_mode_passes_the_header_through() {
 }
 
 #[tokio::test]
-async fn refuses_a_peer_that_would_accept_ordinary_tokens_or_repeats_another() {
+async fn refuses_a_peer_that_would_accept_ordinary_tokens_repeats_another_or_takes_a_credential_header() {
     let build = |peers: Vec<Peer>| JwksStore::with_options(String::new(), AUDIENCE.into(), true, AuthOptions { peers, ..Default::default() });
-    let own = Peer { audience: AUDIENCE.into(), ..peer() };
-    assert!(build(vec![own]).await.is_err());
-    assert!(build(vec![Peer { audience: String::new(), ..peer() }]).await.is_err());
-    let again = Peer { audience: "third-service".into(), ..peer() };
-    assert!(build(vec![peer(), again]).await.is_err());
+    let header = || HeaderName::from_static(PEER_HEADER);
+    assert!(build(vec![Peer::new("peer", header(), AUDIENCE)]).await.is_err());
+    assert!(build(vec![Peer::new("peer", header(), "")]).await.is_err());
+    assert!(build(vec![peer(), Peer::new("peer", HeaderName::from_static("x-other"), "third-service")]).await.is_err());
+    assert!(build(vec![peer(), Peer::new("other", header(), "third-service")]).await.is_err());
+    for credential in ["authorization", "cookie", "x-bff-assertion"] {
+        assert!(build(vec![Peer::new("peer", HeaderName::from_static(credential), PEER_AUDIENCE)]).await.is_err(), "{credential}");
+    }
     assert!(build(vec![peer()]).await.is_ok());
 }
