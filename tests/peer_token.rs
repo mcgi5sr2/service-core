@@ -109,8 +109,9 @@ async fn keeps_the_two_audiences_apart_and_needs_both_claims() {
     let issuer = start_idp().await;
     let store = store(&issuer, false).await;
     let both = sign("k1", &json!({ "iss": issuer, "sub": "user-1", "aud": [AUDIENCE, PEER_AUDIENCE], "exp": now() + 600 }));
-    // Issued for both: neither a peer token nor a credential here.
-    assert_eq!(store.peer_token(&forwarded(&both), &user("user-1"), "peer").await.unwrap_err(), StatusCode::UNAUTHORIZED);
+    // Issued for both, as a provider's cross-client token is (it adds the requesting
+    // client, here this service's audience): a peer token, but not a credential here.
+    assert_eq!(store.peer_token(&forwarded(&both), &user("user-1"), "peer").await.unwrap().unwrap().bearer(), both);
     assert_eq!(store.validate(&both).await.unwrap_err(), StatusCode::UNAUTHORIZED);
     // An ordinary token is still a credential, and a peer token isn't one.
     assert_eq!(store.validate(&token(&issuer, "user-1", AUDIENCE, now() + 600)).await.unwrap().sub, "user-1");
