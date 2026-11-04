@@ -21,6 +21,9 @@
 //!   cookie, and `/auth/{login,callback,logout,me}`. The session is accepted by
 //!   [`auth::AuthenticatedUser`] like a bearer. Feature `openapi` adds the routes'
 //!   OpenAPI description.
+//! - [`peer`] — verifying a token an upstream forwards for a peer service, so a
+//!   service can call that peer as the request's user
+//!   ([`auth::JwksStore::peer_token`]).
 
 pub mod auth;
 pub mod bff;
@@ -30,5 +33,6 @@ pub mod jobs;
 pub mod llm;
 #[cfg(feature = "login")]
 pub mod login;
+pub mod peer;
 #[cfg(feature = "wg")]
 pub mod wg;

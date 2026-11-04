@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{FromRef, FromRequestParts};
-use axum::http::{StatusCode, request::Parts};
+use axum::http::{HeaderMap, StatusCode, request::Parts};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,8 @@ pub struct JwksStore {
     /// cookie is accepted through it (feature `login`).
     #[cfg(feature = "login")]
     login: Option<Arc<crate::login::Login>>,
+    /// Peers whose forwarded tokens [`JwksStore::peer_token`] accepts ([`crate::peer`]).
+    peers: Vec<crate::peer::Peer>,
 }
 
 /// The optional identity paths a [`JwksStore`] accepts besides a bearer token.
@@ -82,6 +84,10 @@ pub struct AuthOptions {
     /// Accept the browser session cookie of this service's own sign-in.
     #[cfg(feature = "login")]
     pub login: Option<Arc<crate::login::Login>>,
+    /// Peer services whose tokens an upstream may forward beside the request's own
+    /// credential ([`crate::peer`]). Not an identity path: read only through
+    /// [`JwksStore::peer_token`], after the request has authenticated.
+    pub peers: Vec<crate::peer::Peer>,
 }
 
 impl JwksStore {
@@ -135,6 +141,15 @@ impl JwksStore {
         {
             anyhow::bail!("service-core auth: dev_no_auth is {dev_no_auth} but the login's is {}; they must match", login.is_disabled());
         }
+        for (i, peer) in options.peers.iter().enumerate() {
+            if peer.audience.is_empty() || peer.audience == audience {
+                // The service's own audience would make every ordinary token pass as a peer token.
+                anyhow::bail!("service-core auth: peer '{}' needs an audience of its own, not empty or this service's", peer.name);
+            }
+            if options.peers[..i].iter().any(|other| other.name == peer.name || other.header == peer.header) {
+                anyhow::bail!("service-core auth: peer '{}' repeats another peer's name or header", peer.name);
+            }
+        }
         let http = crate::http::idp_client_builder().build()?;
         let keys = if dev_no_auth || issuer.is_empty() {
             tracing::warn!("service-core auth: DISABLED (dev_no_auth or empty issuer)");
@@ -163,6 +178,7 @@ impl JwksStore {
             bff: options.bff,
             #[cfg(feature = "login")]
             login: options.login,
+            peers: options.peers,
         }))
     }
 
@@ -186,6 +202,42 @@ impl JwksStore {
     /// Validate a bearer token and return its claims. Handles the gated JWKS refresh
     /// internally. Returns `401` on any failure (fail-closed).
     pub async fn validate(&self, token: &str) -> Result<Claims, StatusCode> {
+        self.validate_for(token, &self.audience).await
+    }
+
+    /// The peer token `peer` forwarded on this request, verified for `user` (the
+    /// request's authenticated user): `None` when the request carries none, `401`
+    /// when it carries one that fails validation (issuer, keys, the peer's audience,
+    /// expiry) or belongs to someone else. A `peer` this store wasn't built with is a
+    /// programming error, answered `500`. See [`crate::peer`] for the trust model.
+    ///
+    /// With `dev_no_auth` the header is passed through unverified, as every other
+    /// credential is.
+    pub async fn peer_token(&self, headers: &HeaderMap, user: &Claims, peer: &str) -> Result<Option<crate::peer::PeerToken>, StatusCode> {
+        let Some(config) = self.peers.iter().find(|candidate| candidate.name == peer) else {
+            tracing::error!("auth: peer '{peer}' is not configured");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+        let Some(value) = headers.get(&config.header) else {
+            return Ok(None);
+        };
+        let token = value.to_str().map_err(|_| {
+            tracing::warn!("auth: peer '{peer}' token header is not ASCII");
+            StatusCode::UNAUTHORIZED
+        })?;
+        if self.dev_no_auth {
+            return Ok(Some(crate::peer::PeerToken { token: token.to_owned(), claims: user.clone() }));
+        }
+        let claims = self.validate_for(token, &config.audience).await?;
+        if claims.sub != user.sub {
+            tracing::warn!("auth: peer '{peer}' token is for another subject than the request's user");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        Ok(Some(crate::peer::PeerToken { token: token.to_owned(), claims }))
+    }
+
+    /// [`validate`](Self::validate) for any audience this issuer serves.
+    async fn validate_for(&self, token: &str, audience: &str) -> Result<Claims, StatusCode> {
         let header = decode_header(token).map_err(|e| {
             tracing::warn!("auth: failed to decode JWT header: {e}");
             StatusCode::UNAUTHORIZED
@@ -233,7 +285,7 @@ impl JwksStore {
 
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(&[&self.issuer]);
-        validation.set_audience(&[&self.audience]);
+        validation.set_audience(&[audience]);
         decode::<Claims>(token, &decoding_key, &validation)
             .map(|data| data.claims)
             .map_err(|e| {
