@@ -51,6 +51,45 @@ loaded gun: it makes every extractor succeed. Gate it behind an explicit environ
 that is never set in a deployed environment, and treat `is_disabled()` as something worth
 surfacing on a health endpoint.
 
+### Peer tokens
+
+Some services, behind a backend-for-frontend, need to call a *peer* service as the signed-in
+user. The peer accepts only tokens issued for its own audience, and the BFF's ordinary token
+must not be one: every service the BFF forwards to could then act at the peer. So the BFF keeps
+a separate grant for the peer and forwards that token in a header of its own, to the services
+allowed to use it.
+
+`JwksStore::peer_token` is the receiving end. It doesn't trust the header because of where it
+came from. It verifies the token against the same issuer and keys as the request's own
+credential, with the peer's audience, and only hands it back if it belongs to the user the
+request already authenticated as. Without that check, a caller could pair their own sign-in with
+someone else's peer token.
+
+```rust
+use axum::http::{HeaderMap, HeaderName, StatusCode};
+use service_core::auth::{AuthOptions, AuthenticatedUser, JwksStore};
+use service_core::peer::Peer;
+
+let peers = vec![Peer::new("tracker", HeaderName::from_static("x-tracker-token"), "tracker")];
+let jwks = JwksStore::with_options(issuer, audience, false, AuthOptions { peers, ..Default::default() }).await?;
+
+async fn handler(State(jwks): State<Arc<JwksStore>>, user: AuthenticatedUser, headers: HeaderMap) -> Result<String, StatusCode> {
+    // None: the request came without one (say, not through the BFF); 401: it came with a bad one.
+    let Some(peer) = jwks.peer_token(&headers, &user.claims, "tracker").await? else { return Err(StatusCode::FORBIDDEN) };
+    // Call the peer with `Authorization: Bearer {peer.bearer()}`.
+    todo!()
+}
+```
+
+A peer's audience must be its own: `with_options` refuses one that is empty or this service's
+audience, a repeated name or header, and a credential header (`Authorization`, `Cookie`, the
+BFF assertion's), and a login whose provider isn't the store's. A token issued for both this
+service and the peer is neither a peer token nor a bearer here. With a provider that gives each
+client its own (pairwise) subject for a user, the subjects never match and every peer token is
+refused. What the peer lets the token do, and how old it may be,
+is for the peer to enforce. The raw token is never logged, and `PeerToken`'s `Debug` leaves it
+out.
+
 ## `jobs` — bounded async-job store
 
 An in-memory store for the submit-then-poll pattern, built so a job API cannot become an
