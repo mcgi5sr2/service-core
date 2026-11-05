@@ -14,6 +14,16 @@ set -euo pipefail
 
 BUMP="${1:-patch}"
 
+# --- branch guard ------------------------------------------------------------
+# The bump commit and tag are pushed as `main`, but they are made on whatever is
+# checked out. From any other branch the tag would name the wrong tree, and the
+# push would fail only at the end. Not overridable by RELEASE_FORCE: no release is
+# right from another branch.
+if [ "$(git branch --show-current)" != "main" ]; then
+  echo "release: REFUSING — on branch '$(git branch --show-current)', not main; releases are cut from main." >&2
+  exit 1
+fi
+
 # --- freshness guard ---------------------------------------------------------
 # A tag must name EXACTLY what the branch says. A dirty tree tags uncommitted
 # edits; a stale checkout tags a commit that lacks work the branch claims to
